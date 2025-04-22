@@ -21,6 +21,7 @@
 (define-constant ERR-BET-AMOUNT-TOO-SMALL (err u14))
 (define-constant ERR-BET-AMOUNT-TOO-LARGE (err u15))
 (define-constant ERR-INVALID-INPUT-PARAMETER (err u16))
+(define-constant ERR-INVALID-MARKET-ID (err u17))
 
 ;; Validation Constants
 (define-constant MAX-ALLOWED-CLOSING-DELAY u52560) ;; ~1 year in blocks
@@ -104,6 +105,20 @@
   )
 )
 
+;; Verify market ID exists before deletion
+(define-private (validate-market-id-before-delete (market-id uint))
+  (match (map-get? prediction-markets { market-id: market-id })
+    market-data true
+    false)
+)
+
+;; Verify user bet exists before deletion
+(define-private (validate-user-bet-before-delete (market-id uint) (user principal))
+  (match (map-get? user-bets { market-id: market-id, better: user })
+    bet-data true
+    false)
+)
+
 ;; Market Creation & Management
 ;; Create a new prediction market with validation
 (define-public (create-prediction-market (description (string-ascii 256)) (closing-height uint))
@@ -173,6 +188,7 @@
     (
       (market-data (unwrap! (map-get? prediction-markets { market-id: market-id }) ERR-MARKET-DOES-NOT-EXIST))
     )
+    (asserts! (is-valid-market-id? market-id) ERR-INVALID-MARKET-ID)
     (asserts! (>= block-height (get closing-height market-data)) ERR-MARKET-STILL-OPEN)
     (asserts! (is-none (get actual-outcome market-data)) ERR-MARKET-ALREADY-RESOLVED)
     (asserts! (not (is-market-expired? market-id)) ERR-MARKET-ALREADY-EXPIRED)
@@ -191,20 +207,28 @@
 
 ;; Claim winnings for a correct prediction
 (define-public (claim-prediction-winnings (market-id uint))
-  (let
-    (
-      (market-data (unwrap! (map-get? prediction-markets { market-id: market-id }) ERR-MARKET-DOES-NOT-EXIST))
-      (user-bet (unwrap! (map-get? user-bets { market-id: market-id, better: tx-sender }) ERR-NO-BET-FOUND))
-      (market-outcome (unwrap! (get actual-outcome market-data) ERR-MARKET-NOT-RESOLVED-YET))
-    )
-    (asserts! (is-eq (get predicted-outcome user-bet) market-outcome) ERR-PREDICTION-INCORRECT)
+  (begin
+    ;; Validate market-id first
+    (asserts! (is-valid-market-id? market-id) ERR-INVALID-MARKET-ID)
     
-    ;; Process payment - could implement more complex payout logic here
-    (let ((payout-amount (get bet-amount user-bet)))
-      ;; Delete the bet record to prevent double-claiming
-      (map-delete user-bets { market-id: market-id, better: tx-sender })
-      ;; Transfer winnings
-      (as-contract (stx-transfer? payout-amount tx-sender tx-sender))
+    (let
+      (
+        (market-data (unwrap! (map-get? prediction-markets { market-id: market-id }) ERR-MARKET-DOES-NOT-EXIST))
+        (user-bet (unwrap! (map-get? user-bets { market-id: market-id, better: tx-sender }) ERR-NO-BET-FOUND))
+        (market-outcome (unwrap! (get actual-outcome market-data) ERR-MARKET-NOT-RESOLVED-YET))
+      )
+      (asserts! (is-eq (get predicted-outcome user-bet) market-outcome) ERR-PREDICTION-INCORRECT)
+      
+      ;; Verify user bet exists before deletion
+      (asserts! (validate-user-bet-before-delete market-id tx-sender) ERR-NO-BET-FOUND)
+      
+      ;; Process payment - could implement more complex payout logic here
+      (let ((payout-amount (get bet-amount user-bet)))
+        ;; Delete the bet record to prevent double-claiming
+        (map-delete user-bets { market-id: market-id, better: tx-sender })
+        ;; Transfer winnings
+        (as-contract (stx-transfer? payout-amount tx-sender tx-sender))
+      )
     )
   )
 )
@@ -213,38 +237,54 @@
 
 ;; Refund bets for expired markets
 (define-public (refund-bet-from-expired-market (market-id uint))
-  (let
-    (
-      (market-data (unwrap! (map-get? prediction-markets { market-id: market-id }) ERR-MARKET-DOES-NOT-EXIST))
-      (user-bet (unwrap! (map-get? user-bets { market-id: market-id, better: tx-sender }) ERR-NO-BET-FOUND))
-    )
-    (asserts! (>= block-height (get expiration-height market-data)) ERR-MARKET-NOT-EXPIRED-YET)
-    (asserts! (is-none (get actual-outcome market-data)) ERR-MARKET-ALREADY-RESOLVED)
+  (begin
+    ;; Validate market-id first
+    (asserts! (is-valid-market-id? market-id) ERR-INVALID-MARKET-ID)
     
-    (let ((refund-amount (get bet-amount user-bet)))
-      ;; Delete the bet record
-      (map-delete user-bets { market-id: market-id, better: tx-sender })
-      ;; Return funds to user
-      (as-contract (stx-transfer? refund-amount tx-sender tx-sender))
+    (let
+      (
+        (market-data (unwrap! (map-get? prediction-markets { market-id: market-id }) ERR-MARKET-DOES-NOT-EXIST))
+        (user-bet (unwrap! (map-get? user-bets { market-id: market-id, better: tx-sender }) ERR-NO-BET-FOUND))
+      )
+      (asserts! (>= block-height (get expiration-height market-data)) ERR-MARKET-NOT-EXPIRED-YET)
+      (asserts! (is-none (get actual-outcome market-data)) ERR-MARKET-ALREADY-RESOLVED)
+      
+      ;; Verify user bet exists before deletion
+      (asserts! (validate-user-bet-before-delete market-id tx-sender) ERR-NO-BET-FOUND)
+      
+      (let ((refund-amount (get bet-amount user-bet)))
+        ;; Delete the bet record
+        (map-delete user-bets { market-id: market-id, better: tx-sender })
+        ;; Return funds to user
+        (as-contract (stx-transfer? refund-amount tx-sender tx-sender))
+      )
     )
   )
 )
 
 ;; Clean up expired market data
 (define-public (cleanup-expired-market (market-id uint))
-  (let
-    (
-      (market-data (unwrap! (map-get? prediction-markets { market-id: market-id }) ERR-MARKET-DOES-NOT-EXIST))
-    )
-    (asserts! (>= block-height (get expiration-height market-data)) ERR-MARKET-NOT-EXPIRED-YET)
-    (asserts! (or 
-                (is-eq tx-sender (get market-creator market-data))
-                (is-eq tx-sender (var-get platform-administrator))
-              ) ERR-UNAUTHORIZED-ACCESS)
+  (begin
+    ;; Validate market-id first
+    (asserts! (is-valid-market-id? market-id) ERR-INVALID-MARKET-ID)
     
-    ;; Delete the market record
-    (map-delete prediction-markets { market-id: market-id })
-    (ok true)
+    (let
+      (
+        (market-data (unwrap! (map-get? prediction-markets { market-id: market-id }) ERR-MARKET-DOES-NOT-EXIST))
+      )
+      (asserts! (>= block-height (get expiration-height market-data)) ERR-MARKET-NOT-EXPIRED-YET)
+      (asserts! (or 
+                  (is-eq tx-sender (get market-creator market-data))
+                  (is-eq tx-sender (var-get platform-administrator))
+                ) ERR-UNAUTHORIZED-ACCESS)
+      
+      ;; Verify market exists before deletion
+      (asserts! (validate-market-id-before-delete market-id) ERR-MARKET-DOES-NOT-EXIST)
+      
+      ;; Delete the market record
+      (map-delete prediction-markets { market-id: market-id })
+      (ok true)
+    )
   )
 )
 
